@@ -17,7 +17,7 @@ RUN npm ci --omit=dev --ignore-scripts
 FROM node:20-alpine AS production
 WORKDIR /app
 ENV NODE_ENV=production
-RUN addgroup --system --gid 1001 mcp && adduser --system --uid 1001 mcp
+RUN apk add --no-cache curl && addgroup --system --gid 1001 mcp && adduser --system --uid 1001 mcp
 COPY --from=build /app/dist ./dist
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY package.json ./

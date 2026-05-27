@@ -140,6 +140,10 @@ export async function runHttp(config: HttpConfig): Promise<void> {
     await session.transport.handlePostMessage(req, res, req.body);
   });
 
+  app.use((_req, res) => {
+    res.status(404).json({ error: 'Not found' });
+  });
+
   app.use((err: Error, _req: Request, res: Response, next: NextFunction) => {
     if (res.headersSent) {
       next(err);

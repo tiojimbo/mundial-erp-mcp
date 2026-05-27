@@ -2,8 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import cors from 'cors';
-import express, { type NextFunction, type Request, type Response } from 'express';
+import express, { type Request, type Response } from 'express';
 import { MundialErpClient } from './api-client.js';
 import { listWorkspaces, validateApiKey } from './auth.js';
 import type { HttpConfig } from './config.js';
@@ -23,21 +22,47 @@ const SERVER_VERSION = '0.1.0';
 type StreamableSession = { transport: StreamableHTTPServerTransport; server: McpServer };
 type SseSession = { transport: SSEServerTransport; server: McpServer };
 
-function extractApiKey(req: Request): string {
-  const header = req.header('authorization') ?? '';
-  const [scheme, value] = header.split(' ');
-  if (scheme?.toLowerCase() !== 'bearer' || !value) throw new AuthError(401);
-  const key = value.trim();
-  if (!key.startsWith('pk_')) throw new AuthError(403);
-  return key;
+function extractApiKey(req: Request): string | null {
+  const header = req.header('authorization')?.trim();
+  if (!header) return null;
+  const token = (header.toLowerCase().startsWith('bearer ') ? header.slice(7) : header).trim();
+  if (!token || !token.startsWith('pk_')) return null;
+  return token;
 }
 
-async function buildServer(apiKey: string, config: HttpConfig): Promise<McpServer> {
-  const client = new MundialErpClient(apiKey, config.apiUrl, config.timeoutMs);
-  await validateApiKey(client);
-  const workspaces = await listWorkspaces(client);
-  const wsId = workspaces[0]?.id;
-  if (!wsId) throw new AuthError(403);
+async function requireAuth(
+  req: Request,
+  res: Response,
+  config: HttpConfig,
+): Promise<{ client: MundialErpClient; wsId: string } | null> {
+  const key = extractApiKey(req);
+  if (!key) {
+    res
+      .status(401)
+      .json({ error: 'Missing or invalid token. Use: Authorization: Bearer pk_...' });
+    return null;
+  }
+  try {
+    const client = new MundialErpClient(key, config.apiUrl, config.timeoutMs);
+    await validateApiKey(client);
+    const workspaces = await listWorkspaces(client);
+    const wsId = workspaces[0]?.id;
+    if (!wsId) {
+      res.status(403).json({ error: 'No accessible workspace.' });
+      return null;
+    }
+    return { client, wsId };
+  } catch (err) {
+    if (err instanceof AuthError) {
+      res.status(err.status).json({ error: sanitizeErrorForLlm(err) });
+      return null;
+    }
+    res.status(500).json({ error: sanitizeErrorForLlm(err) });
+    return null;
+  }
+}
+
+function createServer(client: MundialErpClient, wsId: string): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
   registerMeTool(server, client);
   registerTaskReadTools(server, client);
@@ -54,113 +79,98 @@ async function buildServer(apiKey: string, config: HttpConfig): Promise<McpServe
 
 export async function runHttp(config: HttpConfig): Promise<void> {
   const app = express();
-  app.use(express.json({ limit: '1mb' }));
-  app.use(
-    cors({
-      origin: (origin, cb) => {
-        if (!origin) return cb(null, true);
-        if (config.corsOrigins.includes(origin)) return cb(null, true);
-        return cb(new Error('CORS bloqueado'), false);
-      },
-      credentials: true,
-    }),
-  );
+  app.use(express.json());
 
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok', server: SERVER_NAME, version: SERVER_VERSION });
   });
 
-  const streamable = new Map<string, StreamableSession>();
-  const sse = new Map<string, SseSession>();
+  const streamableTransports = new Map<string, StreamableSession>();
 
-  app.post('/mcp', async (req, res) => {
-    try {
-      const apiKey = extractApiKey(req);
-      const sessionId = req.header('mcp-session-id');
-      let session = sessionId ? streamable.get(sessionId) : undefined;
-      if (!session) {
-        const server = await buildServer(apiKey, config);
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (id) => {
-            streamable.set(id, { transport, server });
-            logger.info('sessão streamable iniciada', {
-              sessionId: id,
-              keyPrefix: maskApiKey(apiKey),
-            });
-          },
-        });
-        transport.onclose = () => {
-          if (transport.sessionId) streamable.delete(transport.sessionId);
-        };
-        await server.connect(transport);
-        session = { transport, server };
-      }
-      await session.transport.handleRequest(req, res, req.body);
-    } catch (err) {
-      if (err instanceof AuthError) {
-        res.status(err.status).json({ error: sanitizeErrorForLlm(err) });
+  app.all('/mcp', async (req, res) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+    if (sessionId && streamableTransports.has(sessionId)) {
+      const entry = streamableTransports.get(sessionId);
+      if (entry) {
+        await entry.transport.handleRequest(req, res, req.body);
         return;
       }
-      logger.error('erro em POST /mcp', {
-        error: err instanceof Error ? err.message : 'unknown',
-      });
-      res.status(500).json({ error: sanitizeErrorForLlm(err) });
     }
+
+    if (req.method === 'POST') {
+      const auth = await requireAuth(req, res, config);
+      if (!auth) return;
+
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+      });
+      const server = createServer(auth.client, auth.wsId);
+
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid) streamableTransports.delete(sid);
+        server.close().catch(() => {});
+      };
+
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+
+      const sid = transport.sessionId;
+      if (sid) {
+        streamableTransports.set(sid, { transport, server });
+        const key = extractApiKey(req);
+        logger.info('sessão streamable iniciada', {
+          sessionId: sid,
+          keyPrefix: key ? maskApiKey(key) : '?',
+        });
+      }
+      return;
+    }
+
+    if (req.method === 'GET' || req.method === 'DELETE') {
+      res.status(400).json({ error: 'No active session. Send a POST to initialize.' });
+      return;
+    }
+
+    res.status(405).json({ error: 'Method not allowed' });
   });
 
+  const sseTransports = new Map<string, SseSession>();
+
   app.get('/sse', async (req, res) => {
-    try {
-      const apiKey = extractApiKey(req);
-      const server = await buildServer(apiKey, config);
-      const transport = new SSEServerTransport('/messages', res);
-      sse.set(transport.sessionId, { transport, server });
-      transport.onclose = () => sse.delete(transport.sessionId);
-      await server.connect(transport);
-      logger.info('sessão sse iniciada', {
-        sessionId: transport.sessionId,
-        keyPrefix: maskApiKey(apiKey),
-      });
-    } catch (err) {
-      if (err instanceof AuthError) {
-        res.status(err.status).json({ error: sanitizeErrorForLlm(err) });
-        return;
-      }
-      res.status(500).json({ error: sanitizeErrorForLlm(err) });
-    }
+    const auth = await requireAuth(req, res, config);
+    if (!auth) return;
+
+    const transport = new SSEServerTransport('/messages', res);
+    const server = createServer(auth.client, auth.wsId);
+
+    transport.onclose = () => {
+      sseTransports.delete(transport.sessionId);
+      server.close().catch(() => {});
+    };
+
+    await server.connect(transport);
+    sseTransports.set(transport.sessionId, { transport, server });
+    const key = extractApiKey(req);
+    logger.info('sessão sse iniciada', {
+      sessionId: transport.sessionId,
+      keyPrefix: key ? maskApiKey(key) : '?',
+    });
+    await transport.start();
   });
 
   app.post('/messages', async (req, res) => {
-    const sessionId = (req.query.sessionId as string) ?? '';
-    const session = sse.get(sessionId);
-    if (!session) {
-      res.status(404).json({ error: 'Sessão não encontrada' });
+    const sessionId = req.query.sessionId as string;
+    const entry = sseTransports.get(sessionId);
+    if (!entry) {
+      res.status(404).json({ error: 'Session not found' });
       return;
     }
-    await session.transport.handlePostMessage(req, res, req.body);
+    await entry.transport.handlePostMessage(req, res, req.body);
   });
 
-  app.use((_req, res) => {
-    res.status(404).json({ error: 'Not found' });
-  });
-
-  app.use((err: Error, _req: Request, res: Response, next: NextFunction) => {
-    if (res.headersSent) {
-      next(err);
-      return;
-    }
-    if (err.message === 'CORS bloqueado') {
-      res.status(403).json({ error: 'Origem não permitida.' });
-      return;
-    }
-    logger.error('erro Express não tratado', { error: err.message });
-    res.status(500).json({ error: 'Erro interno.' });
-  });
-
-  app.listen(config.port, () => {
-    logger.info('mundial-erp-mcp HTTP listening', {
-      port: config.port,
-      corsOrigins: config.corsOrigins,
-    });
+  app.listen(config.port, '0.0.0.0', () => {
+    logger.info('mundial-erp-mcp HTTP listening', { port: config.port });
   });
 }

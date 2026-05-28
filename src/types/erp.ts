@@ -209,3 +209,16 @@ export interface ChatMessageCreated {
   type: string;
   createdAt: string;
 }
+
+export interface ErpUser {
+  id: string;
+  email: string;
+  name: string;
+  role: string;
+  isActive: boolean;
+}
+
+export interface UsersListResponse {
+  data: ErpUser[];
+  meta: { pagination: { page: number; limit: number; total: number; totalPages: number } };
+}

@@ -15,6 +15,7 @@ import { registerHierarchyTools, registerStatusWriteTools } from './tools/hierar
 import { registerMeTool } from './tools/me.js';
 import { registerTaskTypeTools } from './tools/task-types.js';
 import { registerTaskReadTools, registerTaskWriteTools } from './tools/tasks.js';
+import { registerUserTools } from './tools/users.js';
 
 const SERVER_NAME = 'mundial-erp-mcp';
 const SERVER_VERSION = '0.1.0';
@@ -74,6 +75,7 @@ function createServer(client: MundialErpClient, wsId: string): McpServer {
   registerChatReadTools(server, client);
   registerChatWriteTools(server, client);
   registerAutomationTools(server, client);
+  registerUserTools(server, client);
   return server;
 }
 

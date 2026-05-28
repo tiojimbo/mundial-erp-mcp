@@ -13,6 +13,7 @@ import { registerHierarchyTools, registerStatusWriteTools } from './tools/hierar
 import { registerMeTool } from './tools/me.js';
 import { registerTaskTypeTools } from './tools/task-types.js';
 import { registerTaskReadTools, registerTaskWriteTools } from './tools/tasks.js';
+import { registerUserTools } from './tools/users.js';
 
 const SERVER_NAME = 'mundial-erp-mcp';
 const SERVER_VERSION = '0.1.0';
@@ -45,10 +46,11 @@ async function runStdio(config: StdioConfig): Promise<void> {
   registerChatReadTools(server, client);
   registerChatWriteTools(server, client);
   registerAutomationTools(server, client);
+  registerUserTools(server, client);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  logger.info('MCP server stdio conectado', { tools: 24 });
+  logger.info('MCP server stdio conectado', { tools: 26 });
 }
 
 async function main(): Promise<void> {
